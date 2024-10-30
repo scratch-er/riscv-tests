@@ -10,6 +10,9 @@ import tempfile
 import time
 import traceback
 
+from datetime import datetime
+
+import tty
 import pexpect
 import yaml
 
@@ -134,6 +137,9 @@ class Spike:
         else:
             isa = f"RV{self.harts[0].xlen}G"
 
+        if 'V' in isa[2:]:
+            isa += f"_Zvl{self.vlen}b_Zve{self.elen}d"
+
         cmd += ["--isa", isa]
         cmd += ["--dm-auth"]
 
@@ -159,8 +165,6 @@ class Spike:
         if not self.support_haltgroups:
             cmd.append("--dm-no-halt-groups")
 
-        if 'V' in isa[2:]:
-            cmd.append(f"--varch=vlen:{self.vlen},elen:{self.elen}")
 
         assert len(set(t.ram for t in self.harts)) == 1, \
                 "All spike harts must have the same RAM layout"
@@ -294,6 +298,7 @@ class VcsSim:
             pass
 
 class Openocd:
+    # pylint: disable=too-many-instance-attributes
     # pylint: disable-next=consider-using-with
     logfile = tempfile.NamedTemporaryFile(prefix='openocd', suffix='.log')
     logname = logfile.name
@@ -302,27 +307,22 @@ class Openocd:
                  freertos=False, debug_openocd=False):
         self.timeout = timeout
         self.debug_openocd = debug_openocd
+        self.command_count = 0
 
         if server_cmd:
             cmd = shlex.split(server_cmd)
         else:
             cmd = ["openocd"]
-            if debug:
-                cmd.append("-d")
 
         # This command needs to come before any config scripts on the command
         # line, since they are executed in order.
         cmd += [
             # Tell OpenOCD to bind gdb to an unused, ephemeral port.
-            "--command",
-            "gdb_port 0",
-            # Disable tcl and telnet servers, since they are unused and because
-            # the port numbers will conflict if multiple OpenOCD processes are
-            # running on the same server.
-            "--command",
-            "tcl_port disabled",
-            "--command",
-            "telnet_port disabled",
+            "--command", "gdb_port 0",
+            # We create a socket for OpenOCD command line (TCL-RPC)
+            "--command", "tcl_port 0",
+            # don't use telnet
+            "--command", "telnet_port disabled",
         ]
 
         if config:
@@ -332,6 +332,7 @@ class Openocd:
                 sys.exit(1)
 
             cmd += ["-f", self.config_file]
+
         if debug:
             cmd.append("-d")
 
@@ -343,6 +344,9 @@ class Openocd:
 
         # pylint: disable-next=consider-using-with
         raw_logfile = open(Openocd.logname, "wb")
+        # pylint: disable-next=consider-using-with
+        self.read_log_fd = open(Openocd.logname, "rb")
+        self.log_buf = b""
         try:
             # pylint: disable-next=consider-using-with
             spike_dasm = subprocess.Popen("spike-dasm", stdin=subprocess.PIPE,
@@ -364,12 +368,23 @@ class Openocd:
         logfile.flush()
 
         self.gdb_ports = []
-        self.process = self.start(cmd, logfile, extra_env)
+        self.tclrpc_port = None
+        self.start(cmd, logfile, extra_env)
+
+        self.openocd_cli = pexpect.spawn(f"nc localhost {self.tclrpc_port}",
+            echo=False)
+        # TCL-RPC uses \x1a as a watermark for end of message. We set raw
+        # pty mode to disable translation of \x1a to EOF
+        tty.setraw(self.openocd_cli.child_fd)
+        hello_string = self.command(
+            "capture { echo \"Hello TCL-RPC!\" }").decode()
+        if not "Hello TCL-RPC!" in hello_string:
+            raise RuntimeError(f"TCL-RPC - unexpected reply:\n{hello_string}")
 
     def start(self, cmd, logfile, extra_env):
         combined_env = {**os.environ, **extra_env}
         # pylint: disable-next=consider-using-with
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+        self.process = subprocess.Popen(cmd, stdin=None,
                 stdout=logfile, stderr=logfile, env=combined_env)
 
         try:
@@ -377,38 +392,34 @@ class Openocd:
             # using OpenOCD to communicate with a simulator this may take a
             # long time, and gdb will time out when trying to connect if we
             # attempt too early.
-            start = time.time()
-            messaged = False
-            with open(Openocd.logname, "r", encoding='utf-8') as fd:
-                while True:
-                    line = fd.readline()
-                    if not line:
-                        if not process.poll() is None:
-                            raise TestLibError("OpenOCD exited early.")
-                        time.sleep(0.1)
-                        continue
-
-                    m = re.search(
-                        r"Listening on port (\d+) for gdb connections", line)
-                    if m:
-                        self.gdb_ports.append(int(m.group(1)))
-
-                    if "telnet server disabled" in line:
-                        break
-
-                    if not messaged and time.time() - start > 1:
-                        messaged = True
-                        print("Waiting for OpenOCD to start...")
-                    if (time.time() - start) > self.timeout:
-                        raise TestLibError("Timed out waiting for OpenOCD to "
-                                "listen for gdb")
+            while True:
+                m = self.expect(
+                        rb"Listening on port (?P<port>\d+) for "
+                        rb"(?P<server>(?:gdb)|(?:tcl)) connections",
+                        message="Waiting for OpenOCD to start up...")
+                if m["server"] == b"gdb":
+                    self.gdb_ports.append(int(m["port"]))
+                elif m["server"] == b"tcl":
+                    if self.tclrpc_port:
+                        raise TestLibError(
+                            "unexpected re-definition of TCL-RPC port")
+                    self.tclrpc_port = int(m["port"])
+                # WARNING! WARNING! WARNING!
+                # The condition below works properly only if OpenOCD reports
+                # gdb/tcl ports in a specific order. Namely, it requires the
+                # gdb ports to be reported before the tcl one. At the moment
+                # this comment was written OpenOCD reports these ports in the
+                # required order if we have a call to `init` statement in
+                # either target configuration file or command-line parameter.
+                # All configuration files used in testing include a call to
+                # `init`
+                if self.tclrpc_port and (len(self.gdb_ports) > 0):
+                    break
 
             if self.debug_openocd:
                 # pylint: disable=consider-using-with
                 self.debugger = subprocess.Popen(["gnome-terminal", "-e",
-                                                  f"gdb --pid={process.pid}"])
-            return process
-
+                                            f"gdb --pid={self.process.pid}"])
         except Exception:
             print_log(Openocd.logname)
             raise
@@ -433,6 +444,100 @@ class Openocd:
                 if "target smp" in line:
                     return True
         return False
+
+    def command(self, cmd):
+        """Send the command to OpenOCD's TCL-RPC server. Return the output of
+        the command, minus the prompt."""
+        self.openocd_cli.write(f"{cmd}\n\x1a")
+        self.openocd_cli.expect(rb"(.*)\x1a")
+        m = self.openocd_cli.match.group(1)
+        return m
+
+    def expect(self, regex, message=None):
+        """Wait for the regex to match the log, and return the match object. If
+        message is given, print it while waiting.
+        We read the logfile to tell us what OpenOCD has done."""
+        messaged = False
+        start = time.time()
+
+        while True:
+            for line in self.read_log_fd.readlines():
+                line = line.rstrip()
+                # Remove nulls, carriage returns, and newlines.
+                line = re.sub(rb"[\x00\r\n]+", b"", line)
+                # Remove debug messages.
+                debug_match = re.search(rb"Debug: \d+ \d+ .*", line)
+                if debug_match:
+                    line = line[:debug_match.start()] + line[debug_match.end():]
+                    self.log_buf += line
+                else:
+                    self.log_buf += line + b"\n"
+
+            m = re.search(regex, self.log_buf, re.MULTILINE | re.DOTALL)
+            if m:
+                self.log_buf = self.log_buf[m.end():]
+                return m
+
+            if not self.process.poll() is None:
+                raise TestLibError("OpenOCD exited early.")
+
+            if message and not messaged and time.time() - start > 1:
+                messaged = True
+                print(message)
+
+            if (time.time() - start) > self.timeout:
+                raise TestLibError(f"Timed out waiting for {regex} in "
+                                   f"{Openocd.logname}")
+
+            time.sleep(0.1)
+
+    def targets(self):
+        """Run `targets` command."""
+        result = self.command("targets").decode()
+        #     TargetName         Type       Endian TapName            State
+        # --  ------------------ ---------- ------ ------------------ --------
+        #  0* riscv.cpu          riscv      little riscv.cpu          halted
+        lines = result.splitlines()
+        headers = lines[0].split()
+        data = []
+        for line in lines[2:]:
+            if line.strip():
+                data.append(dict(zip(headers, line.split()[1:])))
+        return data
+
+    def wait_until_running(self, harts):
+        """Wait until the given harts are running."""
+        start = time.time()
+        while True:
+            targets = self.targets()
+            if all(targets[hart.id]["State"] == "running" for hart in harts):
+                return
+            if time.time() - start > self.timeout:
+                raise TestLibError("Timed out waiting for targets to run.")
+
+    def set_available(self, harts):
+        """Set the given harts to available, and any others to be unavailable.
+        This uses a custom DMI register (0x1f) that is only implemented in
+        spike."""
+        available_mask = 0
+        for hart in harts:
+            available_mask |= 1 << hart.id
+        self.command(f"riscv dmi_write 0x1f 0x{available_mask:x}")
+
+        # Wait until it happened.
+        start = time.time()
+        while True:
+            currently_available = set()
+            currently_unavailable = set()
+            for i, target in enumerate(self.targets()):
+                if target["State"] == "unavailable":
+                    currently_unavailable.add(i)
+                else:
+                    currently_available.add(i)
+            if currently_available == set(hart.id for hart in harts):
+                return
+            if time.time() - start > self.timeout:
+                raise TestLibError("Timed out waiting for hart availability.")
 
 class OpenocdCli:
     def __init__(self, port=4444):
@@ -492,6 +597,9 @@ class NoSymbol(Exception):
 class UnknownThread(Exception):
     def __init__(self, explanation):
         Exception.__init__(self, explanation)
+
+class ThreadTerminated(Exception):
+    pass
 
 Thread = collections.namedtuple('Thread', ('id', 'description', 'target_id',
     'name', 'frame'))
@@ -590,6 +698,15 @@ def parse_rhs(text):
         raise TestLibError(f"Unexpected input: {tokens!r}")
     return result
 
+class CommandException(Exception):
+    pass
+
+class CommandSendTimeout(CommandException):
+    pass
+
+class CommandCompleteTimeout(CommandException):
+    pass
+
 class Gdb:
     """A single gdb class which can interact with one or more gdb instances."""
 
@@ -600,7 +717,8 @@ class Gdb:
             11, 149, 107, 163, 73, 47, 43, 173, 7, 109, 101, 103, 191, 2, 139,
             97, 193, 157, 3, 29, 79, 113, 5, 89, 19, 37, 71, 179, 59, 137, 53)
 
-    def __init__(self, target, ports, cmd=None, timeout=60, binaries=None):
+    def __init__(self, target, ports, cmd=None, timeout=60, binaries=None,
+                 logremote=False):
         assert ports
 
         self.target = target
@@ -635,7 +753,16 @@ class Gdb:
             # Force consistency.
             self.command("set print entry-values no", reset_delays=None)
             self.command(f"set remotetimeout {self.timeout}", reset_delays=None)
-            self.command(f"set remotetimeout {self.target.timeout_sec}")
+            if logremote:
+                # pylint: disable-next=consider-using-with
+                remotelog = tempfile.NamedTemporaryFile(
+                    prefix=f"remote.gdb@{port}-", suffix=".log")
+                if print_log_names:
+                    real_stdout.write(
+                        f"Temporary remotelog: {remotelog.name}\n")
+                self.logfiles.append(remotelog)
+                self.command(f"set remotelogfile {remotelog.name}",
+                             reset_delays=None)
         self.active_child = self.children[0]
 
     def connect(self):
@@ -691,6 +818,8 @@ class Gdb:
             output = self.command(f"thread {h['thread'].id}", ops=5)
             if "Unknown" in output:
                 raise UnknownThread(output)
+            if f"Thread ID {h['thread'].id} has terminated" in output:
+                raise ThreadTerminated(output)
 
     def push_state(self):
         self.stack.append({
@@ -718,8 +847,15 @@ class Gdb:
                     reset_delays=None)
         timeout = max(1, ops) * self.timeout
         self.active_child.sendline(command)
-        self.active_child.expect("\n", timeout=timeout)
-        self.active_child.expect(r"\(gdb\)", timeout=timeout)
+        try:
+            self.active_child.expect(re.escape(command), timeout=timeout)
+            self.active_child.expect("\n", timeout=timeout)
+        except pexpect.exceptions.TIMEOUT as exc:
+            raise CommandSendTimeout(command) from exc
+        try:
+            self.active_child.expect(r"\(gdb\)", timeout=timeout)
+        except pexpect.exceptions.TIMEOUT as exc:
+            raise CommandCompleteTimeout(command) from exc
         output = self.active_child.before.decode("utf-8", errors="ignore")
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         return ansi_escape.sub('', output).strip()
@@ -814,9 +950,10 @@ class Gdb:
         return self.active_child.before.strip().decode()
 
     def interrupt_all(self):
-        for child in self.children:
-            self.select_child(child)
-            self.interrupt()
+        with PrivateState(self):
+            for child in self.children:
+                self.select_child(child)
+                self.interrupt()
 
     def x(self, address, size='w', count=1):
         output = self.command(f"x/{count}{size} {address}", ops=count / 16)
@@ -948,12 +1085,16 @@ class PrivateState:
 
 def load_excluded_tests(excluded_tests_file, target_name):
     result = []
-    if excluded_tests_file is None or len(excluded_tests_file) == 0:
+    if excluded_tests_file is None:
+        # No list of excluded tests was specified
         return result
 
     target_excludes = {}
     with open(excluded_tests_file, encoding="utf-8") as file:
         raw_data = yaml.safe_load(file)
+        if raw_data is None:
+            # File contains no targets
+            return result
         for (target, test_list) in raw_data.items():
             if not isinstance(test_list, list):
                 raise ValueError(
@@ -976,11 +1117,15 @@ def load_excluded_tests(excluded_tests_file, target_name):
 
 def run_all_tests(module, target, parsed):
     todo = []
+    if not parsed.hart is None:
+        target_hart = target.harts[parsed.hart]
+    else:
+        target_hart = None
     for name in dir(module):
         definition = getattr(module, name)
         if isinstance(definition, type) and hasattr(definition, 'test') and \
                 (not parsed.test or any(test in name for test in parsed.test)):
-            todo.append((name, definition, None))
+            todo.append((name, definition, target_hart))
 
     if parsed.list_tests:
         for name, definition, hart in todo:
@@ -1002,6 +1147,8 @@ def run_all_tests(module, target, parsed):
     gcc_cmd = parsed.gcc
     global target_timeout  # pylint: disable=global-statement
     target_timeout = parsed.target_timeout
+    global remotelogfile_enable  # pylint: disable=global-statement
+    remotelogfile_enable = parsed.remotelogfile_enable
 
     examine_added = False
     for hart in target.harts:
@@ -1016,6 +1163,14 @@ def run_all_tests(module, target, parsed):
 
     excluded_tests = load_excluded_tests(parsed.exclude_tests, target.name)
     target.skip_tests += excluded_tests
+
+    # initialize PRNG
+    selected_seed = parsed.seed
+    if parsed.seed is None:
+        selected_seed = int(datetime.now().timestamp())
+        print(f"PRNG seed for {target.name} is generated automatically")
+    print(f"PRNG seed for {target.name} is {selected_seed}")
+    random.seed(selected_seed)
 
     results, count = run_tests(parsed, target, todo)
 
@@ -1048,7 +1203,10 @@ def run_tests(parsed, target, todo):
             result = instance.run()
             log_fd.write(f"Result: {result}\n")
             log_fd.write(f"Logfile: {log_name}\n")
-            log_fd.write(f"Reproduce: {sys.argv[0]} {parsed.target} {name}\n")
+            log_fd.write(f"Reproduce: {sys.argv[0]} {parsed.target} {name}")
+            if len(target.harts) > 1:
+                log_fd.write(f" --hart {instance.hart.id}")
+            log_fd.write("\n")
         finally:
             sys.stdout = real_stdout
             log_fd.write(f"Time elapsed: {time.time() - start:.2f}s\n")
@@ -1107,6 +1265,16 @@ def add_test_run_options(parser):
             help="Specify yaml file listing tests to exclude")
     parser.add_argument("--target-timeout",
             help="Override the base target timeout.", default=None, type=int)
+    parser.add_argument("--seed",
+            help="Use user-specified seed value for PRNG.", default=None,
+            type=int)
+    parser.add_argument("--remotelogfile-enable",
+            help="If specified save GDB will record remote session to a file",
+            action="store_true",
+            default=False)
+    parser.add_argument("--hart",
+            help="Run tests against this hart in multihart tests.",
+            default=None, type=int)
 
 def header(title, dash='-', length=78):
     if title:
@@ -1133,10 +1301,11 @@ class BaseTest:
 
     def __init__(self, target, hart=None):
         self.target = target
-        if hart:
+        if not hart is None:
             self.hart = hart
         else:
             self.hart = random.choice(target.harts)
+            #self.hart = target.harts[-1]
         self.server = None
         self.target_process = None
         self.binary = None
@@ -1250,6 +1419,7 @@ class BaseTest:
 
 gdb_cmd = None
 target_timeout = None
+remotelogfile_enable = False
 class GdbTest(BaseTest):
     def __init__(self, target, hart=None):
         BaseTest.__init__(self, target, hart=hart)
@@ -1266,7 +1436,8 @@ class GdbTest(BaseTest):
 
         self.gdb = Gdb(self.target, self.server.gdb_ports, cmd=gdb_cmd,
                        timeout=target_timeout or self.target.timeout_sec,
-                       binaries=self.binaries)
+                       binaries=self.binaries,
+                       logremote=remotelogfile_enable)
 
         self.logs += self.gdb.lognames()
         self.gdb.connect()
@@ -1308,6 +1479,7 @@ class GdbTest(BaseTest):
                     self.gdb.p(f"$pc={symbol}")
 
         self.gdb.select_hart(self.hart)
+        self.gdb.command(f"monitor targets {self.hart.id}")
 
     def disable_pmp(self):
         # Disable physical memory protection by allowing U mode access to all
@@ -1325,6 +1497,13 @@ class GdbTest(BaseTest):
         except CouldNotFetch:
             # PMP registers are optional
             pass
+
+    def disable_timer(self, interrupt=False):
+        for hart in self.target.harts:
+            self.gdb.select_hart(hart)
+            if interrupt:
+                self.gdb.interrupt()
+            self.gdb.p("$mie=$mie & ~0x80")
 
     def exit(self, expected_result=10):
         self.gdb.command("delete")
